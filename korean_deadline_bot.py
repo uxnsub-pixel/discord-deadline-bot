@@ -11,7 +11,7 @@
 - /프로젝트삭제   : (봇 관리자 전용) 프로젝트 전체 삭제 (모든 분야 포함)
 
 동작 방식:
-- 매 시간마다 완료되지 않은 분야(+ 담당자 미정인 최종 마감일)를 확인해서, 마감일까지 남은 일수가
+- 매일 낮 12시(한국시간)에 완료되지 않은 분야(+ 담당자 미정인 최종 마감일)를 확인해서, 마감일까지 남은 일수가
   14일 / 5일 / 3일 / 2일 / 1일 / 0일(당일) 이 되면 알려줍니다.
 - 알림은 항상 그 프로젝트를 `/프로젝트등록` 했던 채널로만 갑니다 (다른 채널에서 /분야등록 해도 안 바뀜).
 - 분야마다 독립적으로 알림 주기가 돌아갑니다.
@@ -39,7 +39,7 @@ import os
 import json
 import asyncio
 import threading
-from datetime import datetime, timedelta, timezone, date
+from datetime import datetime, timedelta, timezone, date, time as dtime
 
 import requests
 import discord
@@ -52,6 +52,7 @@ from flask import Flask
 # ────────────────────────────────
 DATA_FILE = "projects.json"
 KST = timezone(timedelta(hours=9))  # 한국 시간
+NOTIFY_TIME = dtime(hour=12, minute=0, tzinfo=KST)  # 매일 마감 알림을 체크할 시각 (한국시간 낮 12시)
 MILESTONES = [14, 5, 3, 2, 1, 0]  # 마감 며칠 전에 알려줄지 (0 = 당일)
 
 # 고정 분야 목록. "영상"의 마감일이 곧 프로젝트의 최종 마감일(=업로드일)로 취급됩니다.
@@ -411,7 +412,7 @@ async def remove_project(interaction: discord.Interaction, project: str):
 # ────────────────────────────────
 # 백그라운드 루프: 1시간마다 마감 체크 (분야별로 독립 동작)
 # ────────────────────────────────
-@tasks.loop(hours=1)
+@tasks.loop(time=NOTIFY_TIME)
 async def check_deadlines():
     today = datetime.now(KST).date()
     changed = False
