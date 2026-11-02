@@ -10,6 +10,10 @@
 - /프로젝트목록   : 전체 프로젝트와 각 분야별 담당자/마감일/남은 일수/완료 여부 확인
 - /프로젝트삭제   : (봇 관리자 전용) 프로젝트 전체 삭제 (모든 분야 포함)
 
+- /메시지보내기   : (봇 관리자 전용) 지금 바로 원하는 채널 또는 특정 사람 DM으로 메시지 발송
+- /예약발송      : (봇 관리자 전용) 지정한 날짜·시각(한국시간)에 채널 또는 DM으로 메시지 발송 (매일/매주 반복 가능)
+- /예약목록, /예약삭제 : (봇 관리자 전용) 예약된 메시지 확인 / 취소
+
 동작 방식:
 - 매일 낮 12시(한국시간)에 완료되지 않은 분야(+ 담당자 미정인 최종 마감일)를 확인해서, 마감일까지 남은 일수가
   14일 / 5일 / 3일 / 2일 / 1일 / 0일(당일) 이 되면 알려줍니다.
@@ -169,6 +173,15 @@ def parse_date(text: str) -> date | None:
         except ValueError:
             continue
     return None
+
+
+def parse_hhmm(text: str) -> dtime | None:
+    """'14:30' 형식 (24시간제)"""
+    try:
+        h, m = text.strip().split(":")
+        return dtime(hour=int(h), minute=int(m))
+    except (ValueError, TypeError):
+        return None
 
 
 # ────────────────────────────────
@@ -410,7 +423,198 @@ async def remove_project(interaction: discord.Interaction, project: str):
 
 
 # ────────────────────────────────
-# 백그라운드 루프: 1시간마다 마감 체크 (분야별로 독립 동작)
+# 예약 메시지 / DM 발송 (봇 관리자 전용)
+# 저장 형태: data["scheduled"] = [ {id, target_type("channel"/"user"), target_id,
+#            message, due(한국시간, ISO), repeat("none"/"daily"/"weekly"), created_by} ]
+# ────────────────────────────────
+REPEAT_STEPS = {"daily": timedelta(days=1), "weekly": timedelta(days=7)}
+REPEAT_LABELS = {"none": "반복 없음", "daily": "매일", "weekly": "매주"}
+
+
+def _now_kst_naive() -> datetime:
+    return datetime.now(KST).replace(tzinfo=None)
+
+
+def _resolve_target(interaction: discord.Interaction, channel, user):
+    """(target_type, target_id, 에러문구) 반환. 채널/사람 둘 다 비우면 명령어를 친 채널."""
+    if channel and user:
+        return None, None, "⚠️ 채널과 사람 중 **하나만** 지정해주세요."
+    if user:
+        return "user", user.id, None
+    if channel:
+        return "channel", channel.id, None
+    return "channel", interaction.channel_id, None
+
+
+def _target_label(target_type: str, target_id: int) -> str:
+    return f"<@{target_id}> (DM)" if target_type == "user" else f"<#{target_id}>"
+
+
+async def _deliver(target_type: str, target_id: int, message: str) -> bool:
+    """실제로 메시지를 보냄. 성공하면 True. (\\n 은 줄바꿈으로 바꿔서 보냄)"""
+    text = message.replace("\\n", "\n")
+    try:
+        if target_type == "user":
+            user = bot.get_user(target_id) or await bot.fetch_user(target_id)
+            await user.send(text)
+        else:
+            ch = bot.get_channel(target_id) or await bot.fetch_channel(target_id)
+            await ch.send(text)
+        return True
+    except (discord.Forbidden, discord.NotFound, discord.HTTPException) as e:
+        print(f"⚠️ 메시지 전송 실패 ({target_type} {target_id}): {e}")
+        return False
+
+
+@bot.tree.command(name="메시지보내기", description="(봇 관리자 전용) 지금 바로 채널 또는 DM으로 메시지를 보냅니다.")
+@owner_only()
+@app_commands.describe(
+    message="보낼 내용 (줄바꿈은 \\n 으로 입력)",
+    channel="보낼 채널 (비우면 지금 이 채널)",
+    user="DM으로 보낼 사람 (채널 대신 DM)",
+)
+async def send_now(
+    interaction: discord.Interaction,
+    message: str,
+    channel: discord.TextChannel = None,
+    user: discord.User = None,
+):
+    target_type, target_id, err = _resolve_target(interaction, channel, user)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    ok = await _deliver(target_type, target_id, message)
+    if ok:
+        await interaction.followup.send(f"✅ {_target_label(target_type, target_id)} 로 보냈어요.", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "❌ 보내지 못했어요. DM이라면 상대가 '서버 멤버의 DM 허용'을 꺼뒀거나 봇과 같은 서버에 없을 수 있고, "
+            "채널이라면 봇에게 그 채널의 메시지 보내기 권한이 있는지 확인해주세요.",
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(name="예약발송", description="(봇 관리자 전용) 지정한 날짜·시각(한국시간)에 채널 또는 DM으로 메시지를 보냅니다.")
+@owner_only()
+@app_commands.describe(
+    message="보낼 내용 (줄바꿈은 \\n 으로 입력)",
+    day="날짜 예: 2026-10-01 또는 10-01",
+    at="시각(24시간제) 예: 14:30",
+    channel="보낼 채널 (비우면 지금 이 채널)",
+    user="DM으로 보낼 사람 (채널 대신 DM)",
+    repeat="반복 여부 (기본: 반복 없음)",
+)
+@app_commands.rename(day="date", at="time")
+@app_commands.choices(
+    repeat=[
+        app_commands.Choice(name="반복 없음", value="none"),
+        app_commands.Choice(name="매일", value="daily"),
+        app_commands.Choice(name="매주", value="weekly"),
+    ]
+)
+async def schedule_message(
+    interaction: discord.Interaction,
+    message: str,
+    day: str,
+    at: str,
+    channel: discord.TextChannel = None,
+    user: discord.User = None,
+    repeat: app_commands.Choice[str] = None,
+):
+    target_type, target_id, err = _resolve_target(interaction, channel, user)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+
+    due_date = parse_date(day)
+    due_time = parse_hhmm(at)
+    if due_date is None or due_time is None:
+        await interaction.response.send_message(
+            "⚠️ 날짜/시각 형식이 올바르지 않아요. 날짜 예: `2026-10-01` 또는 `10-01`, 시각 예: `14:30` (24시간제)",
+            ephemeral=True,
+        )
+        return
+
+    repeat_value = repeat.value if repeat else "none"
+    due = datetime.combine(due_date, due_time)
+    now = _now_kst_naive()
+    if due <= now:
+        step = REPEAT_STEPS.get(repeat_value)
+        if step is None:
+            await interaction.response.send_message("⚠️ 이미 지난 시각이에요. 미래 시각으로 지정해주세요.", ephemeral=True)
+            return
+        while due <= now:  # 반복 예약이면 다음 차례 시각으로 맞춤
+            due += step
+
+    schedule_id = data.get("next_sched_id", 1)
+    data["next_sched_id"] = schedule_id + 1
+    data.setdefault("scheduled", []).append(
+        {
+            "id": schedule_id,
+            "target_type": target_type,
+            "target_id": target_id,
+            "message": message,
+            "due": due.isoformat(),
+            "repeat": repeat_value,
+            "created_by": interaction.user.id,
+        }
+    )
+    await asyncio.to_thread(save_data, data)
+
+    await interaction.response.send_message(
+        f"⏰ 예약 완료! (예약 ID: **{schedule_id}**)\n"
+        f"받는 곳: {_target_label(target_type, target_id)}\n"
+        f"보낼 시각: **{due:%Y-%m-%d %H:%M}** (한국시간) / {REPEAT_LABELS[repeat_value]}\n"
+        f"내용: {message}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="예약목록", description="(봇 관리자 전용) 예약된 메시지 목록을 봅니다.")
+@owner_only()
+async def list_scheduled(interaction: discord.Interaction):
+    items = sorted(data.get("scheduled", []), key=lambda s: s["due"])
+    if not items:
+        await interaction.response.send_message("예약된 메시지가 없어요.", ephemeral=True)
+        return
+
+    lines = []
+    for s in items:
+        due = datetime.fromisoformat(s["due"])
+        preview = s["message"].replace("\\n", " ")
+        if len(preview) > 40:
+            preview = preview[:40] + "…"
+        lines.append(
+            f"`#{s['id']}` {due:%m/%d %H:%M} | {REPEAT_LABELS.get(s.get('repeat', 'none'), '반복 없음')} | "
+            f"{_target_label(s['target_type'], s['target_id'])} | {preview}"
+        )
+
+    text = "\n".join(lines)
+    if len(text) > 1900:
+        text = text[:1900] + "\n…(너무 길어서 일부만 표시)"
+    await interaction.response.send_message(text, ephemeral=True)
+
+
+@bot.tree.command(name="예약삭제", description="(봇 관리자 전용) 예약된 메시지를 취소합니다.")
+@owner_only()
+@app_commands.describe(schedule_id="취소할 예약 ID (/예약목록 으로 확인)")
+@app_commands.rename(schedule_id="id")
+async def cancel_scheduled(interaction: discord.Interaction, schedule_id: int):
+    items = data.get("scheduled", [])
+    target = next((s for s in items if s["id"] == schedule_id), None)
+    if not target:
+        await interaction.response.send_message("❌ 해당 ID의 예약을 찾을 수 없어요.", ephemeral=True)
+        return
+
+    items.remove(target)
+    await asyncio.to_thread(save_data, data)
+    await interaction.response.send_message(f"🗑️ 예약 `#{schedule_id}` 취소했어요.", ephemeral=True)
+
+
+# ────────────────────────────────
+# 백그라운드 루프 ①: 매일 낮 12시(한국시간) 마감 체크 (분야별로 독립 동작)
 # ────────────────────────────────
 @tasks.loop(time=NOTIFY_TIME)
 async def check_deadlines():
@@ -472,6 +676,48 @@ async def before_check_deadlines():
 
 
 # ────────────────────────────────
+# 백그라운드 루프 ②: 1분마다 예약 메시지 확인 (시각이 된 것만 발송)
+# ────────────────────────────────
+@tasks.loop(minutes=1)
+async def check_scheduled():
+    now = _now_kst_naive()
+    changed = False
+
+    for s in list(data.get("scheduled", [])):  # 복사본으로 순회 (도중에 목록이 바뀌어도 안전)
+        due = datetime.fromisoformat(s["due"])
+        if due > now:
+            continue
+
+        ok = await _deliver(s["target_type"], s["target_id"], s["message"])
+
+        # 성공/실패와 관계없이 다음 단계로 넘어감 (실패한 걸 1분마다 무한 재시도하지 않도록)
+        step = REPEAT_STEPS.get(s.get("repeat", "none"))
+        if step:
+            while due <= now:  # 봇이 꺼져 있던 동안 놓친 회차는 건너뛰고 다음 회차로
+                due += step
+            s["due"] = due.isoformat()
+        elif s in data.get("scheduled", []):
+            data["scheduled"].remove(s)
+        changed = True
+
+        if not ok:  # 실패하면 예약을 만든 사람에게 알려줌
+            await _deliver(
+                "user",
+                s["created_by"],
+                f"⚠️ 예약 메시지 #{s['id']} 를 {_target_label(s['target_type'], s['target_id'])} 로 보내지 못했어요. "
+                f"(DM 차단 또는 채널 권한 문제일 수 있어요)",
+            )
+
+    if changed:
+        await asyncio.to_thread(save_data, data)
+
+
+@check_scheduled.before_loop
+async def before_check_scheduled():
+    await bot.wait_until_ready()
+
+
+# ────────────────────────────────
 # 슬래시 명령어 오류 처리 (권한 체크 실패는 이미 위에서 응답했으므로 조용히 무시)
 # ────────────────────────────────
 @bot.tree.error
@@ -492,9 +738,14 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    check_deadlines.start()
+    # on_ready 는 재연결될 때마다 또 호출될 수 있어서, 이미 돌고 있으면 다시 시작하지 않음
+    if not check_deadlines.is_running():
+        check_deadlines.start()
+    if not check_scheduled.is_running():
+        check_scheduled.start()
     print(f"✅ 로그인 완료: {bot.user} (ID: {bot.user.id})")
-    print("슬래시 명령어 동기화 완료. /프로젝트등록(관리자), /분야등록, /작업완료, /프로젝트목록, /분야삭제, /프로젝트삭제(관리자) 사용 가능")
+    print("슬래시 명령어 동기화 완료. /프로젝트등록(관리자), /분야등록, /작업완료, /프로젝트목록, /분야삭제, /프로젝트삭제(관리자), "
+          "/메시지보내기·/예약발송·/예약목록·/예약삭제(관리자) 사용 가능")
 
 
 if __name__ == "__main__":
